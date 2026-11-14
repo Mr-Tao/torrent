@@ -106,3 +106,64 @@ func (p *Piece) DiscardChunkRange(
 
 	return invalidated, nil
 }
+
+// DiscardAllChunks atomically discards all stored data for a piece
+// and invalidates its received-chunk bitmap.
+//
+// Unlike DiscardChunkRange, this also supports completed pieces.
+// The callback must be synchronous, all-or-nothing, and must not
+// call back into the torrent client.
+func (p *Piece) DiscardAllChunks(discard func() error) error {
+	if p == nil || p.t == nil || p.t.cl == nil {
+		return errors.New("torrent: invalid piece")
+	}
+	if discard == nil {
+		return errors.New("torrent: nil discard callback")
+	}
+
+	t := p.t
+	t.cl.lock()
+	defer t.cl.unlock()
+
+	if !t.haveInfo() ||
+		p.index < 0 ||
+		p.index >= t.numPieces() ||
+		t.closed.IsSet() {
+		return errors.New("torrent: piece not available")
+	}
+
+	p.pendingWritesMutex.Lock()
+	writing := p.pendingWrites != 0
+	p.pendingWritesMutex.Unlock()
+
+	if writing || p.hashing || p.queuedForHash() {
+		return ErrChunkDiscardBusy
+	}
+
+	// The callback must clear storage completion as well as bytes.
+	// The client lock prevents new received chunks from being
+	// registered while the operation is in progress.
+	if err := discard(); err != nil {
+		return err
+	}
+
+	p.dirtyChunks.Clear()
+
+	// Refresh completedPieces and scheduling from storage.
+	changed := t.updatePieceCompletion(p.index)
+	if !changed {
+		t.updatePiecePriority(p.index)
+	}
+
+	// Even if completion did not change, chunk availability did.
+	t.tickleReaders()
+	for c := range t.conns {
+		c.updateRequests()
+	}
+
+	if t.pieceStateChanges != nil {
+		t.publishPieceChange(p.index)
+	}
+
+	return nil
+}
