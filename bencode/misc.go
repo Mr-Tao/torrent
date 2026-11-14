@@ -21,8 +21,5 @@ func bytesAsString(b []byte) string {
 	if len(b) == 0 {
 		return ""
 	}
-	return *(*string)(unsafe.Pointer(&reflect.StringHeader{
-		Data: uintptr(unsafe.Pointer(&b[0])),
-		Len:  len(b),
-	}))
+	return unsafe.String(&b[0], len(b))
 }
