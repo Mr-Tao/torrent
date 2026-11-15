@@ -227,29 +227,42 @@ func (r *reader) ReadContext(ctx context.Context, b []byte) (n int, err error) {
 
 // Wait until some data should be available to read. Tickles the client if it isn't. Returns how
 // much should be readable without blocking.
-func (r *reader) waitAvailable(pos, wanted int64, ctxErr *error, wait bool) (avail int64, err error) {
+func (r *reader) waitAvailable(
+	pos, wanted int64,
+	generation uint64,
+	ctxErr *error,
+	wait bool,
+) (avail int64, err error) {
 	r.t.cl.lock()
 	defer r.t.cl.unlock()
+
 	for {
+		// Seek invalidated this read while it was waiting.
+		if r.posGeneration != generation {
+			return 0, errReaderPositionChanged
+		}
+
 		avail = r.available(pos, wanted)
 		if avail != 0 {
 			return
 		}
+
 		if r.t.closed.IsSet() {
-			err = errors.New("torrent closed")
-			return
+			return 0, errors.New("torrent closed")
 		}
+
 		if *ctxErr != nil {
-			err = *ctxErr
-			return
+			return 0, *ctxErr
 		}
+
 		if !r.t.networkingEnabled {
-			err = errors.New("data not already available")
-			return
+			return 0, errors.New("data not already available")
 		}
+
 		if !wait || wanted == 0 {
 			return
 		}
+
 		r.waitReadable(pos)
 	}
 }
@@ -268,7 +281,13 @@ func (r *reader) readOnceAt(b []byte, pos int64, generation uint64, ctxErr *erro
 	}
 	for {
 		var avail int64
-		avail, err = r.waitAvailable(pos, int64(len(b)), ctxErr, n == 0)
+		avail, err = r.waitAvailable(
+			pos,
+			int64(len(b)),
+			generation,
+			ctxErr,
+			n == 0,
+		)
 		if avail == 0 {
 			return
 		}
@@ -360,6 +379,9 @@ func (r *reader) Seek(off int64, whence int) (ret int64, err error) {
 
 	ret = r.pos
 	r.posChanged()
+	// Wake reads waiting for data at the old position.
+	// They will detect the changed generation and exit.
+	r.t.tickleReaders()
 	return
 }
 

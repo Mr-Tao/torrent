@@ -1,6 +1,7 @@
 package torrent
 
 import (
+	"context"
 	"errors"
 	"io"
 	"sync"
@@ -24,6 +25,7 @@ type seekTestStorage struct {
 	blockFirstRead   atomic.Bool
 	firstReadBlocked chan struct{}
 	firstReadRelease chan struct{}
+	missing          bool
 }
 
 func (s *seekTestStorage) OpenTorrent(
@@ -57,7 +59,10 @@ func (s *seekTestStorage) Close() error {
 }
 
 func (s *seekTestStorage) Completion() storage.Completion {
-	return storage.Completion{Complete: true, Ok: true}
+	return storage.Completion{
+		Complete: !s.missing,
+		Ok:       true,
+	}
 }
 
 func (s *seekTestStorage) MarkComplete() error {
@@ -567,6 +572,145 @@ func TestReaderSeekStartsNewReadWithoutWaiting(t *testing.T) {
 		t.Fatalf(
 			"final position=%d, want=%d",
 			pos, wantPos,
+		)
+	}
+}
+
+func TestReaderSeekCancelsWaitingRead(t *testing.T) {
+	store := &seekTestStorage{
+		entered: make(chan struct{}),
+		release: make(chan struct{}),
+		missing: true,
+	}
+
+	info := metainfo.Info{
+		Name:        "waiting-read.bin",
+		Length:      64 << 10,
+		PieceLength: 16 << 10,
+		Pieces:      make([]byte, 4*20),
+	}
+
+	infoBytes, err := bencode.Marshal(info)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mi := &metainfo.MetaInfo{InfoBytes: infoBytes}
+
+	cfg := NewDefaultClientConfig()
+	cfg.ListenHost = func(string) string {
+		return "127.0.0.1"
+	}
+	cfg.ListenPort = 0
+	cfg.NoDHT = true
+	cfg.DisableUTP = true
+	cfg.DisableIPv6 = true
+	cfg.DisablePEX = true
+	cfg.DisableTrackers = true
+	cfg.NoDefaultPortForwarding = true
+	cfg.DefaultStorage = store
+
+	client, err := NewClient(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.Close()
+
+	torr, _, err := client.AddTorrentSpec(
+		TorrentSpecFromMetaInfo(mi),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader := torr.NewReader().(*reader)
+	defer reader.Close()
+
+	// Context cancellation is only a cleanup fallback.
+	// The Seek itself must invalidate the old read.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	done := make(chan error, 1)
+
+	go func() {
+		buf := make([]byte, 1024)
+		_, err := reader.ReadContext(ctx, buf)
+		done <- err
+	}()
+
+	// Wait until the read has acquired its epoch permit.
+	deadline := time.NewTimer(3 * time.Second)
+	defer deadline.Stop()
+
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+
+waitForRead:
+	for {
+		reader.mu.Lock()
+		epoch := reader.readEpoch
+		active := epoch != nil && len(epoch.permit) == 0
+		reader.mu.Unlock()
+
+		if active {
+			break waitForRead
+		}
+
+		select {
+		case err := <-done:
+			t.Fatalf("read finished unexpectedly: %v", err)
+
+		case <-ticker.C:
+			// Check again.
+
+		case <-deadline.C:
+			t.Fatal("read did not start")
+		}
+	}
+
+	// Allow the read to enter waitAvailable().
+	// The epoch permit proves it started, but not yet
+	// that it has reached the condition-variable wait.
+	select {
+	case err := <-done:
+		t.Fatalf("read finished before seek: %v", err)
+
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	// Seek within the same piece to avoid relying on
+	// piece-priority changes to wake the old read.
+	const seekTarget int64 = 1024
+
+	pos, err := reader.Seek(seekTarget, io.SeekStart)
+	if err != nil || pos != seekTarget {
+		t.Fatalf("seek: pos=%d err=%v", pos, err)
+	}
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, errReaderPositionChanged) {
+			t.Fatalf(
+				"waiting read returned %v, want %v",
+				err, errReaderPositionChanged,
+			)
+		}
+
+	case <-time.After(time.Second):
+		cancel()
+		t.Fatal("old read remained blocked after seek")
+	}
+
+	pos, err = reader.Seek(0, io.SeekCurrent)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if pos != seekTarget {
+		t.Fatalf(
+			"position after canceled read=%d, want %d",
+			pos, seekTarget,
 		)
 	}
 }
