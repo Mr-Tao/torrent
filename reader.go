@@ -31,6 +31,20 @@ type pieceRange struct {
 	begin, end pieceIndex
 }
 
+type readerReadEpoch struct {
+	permit      chan struct{}
+	invalidated chan struct{}
+}
+
+func newReaderReadEpoch() *readerReadEpoch {
+	e := &readerReadEpoch{
+		permit:      make(chan struct{}, 1),
+		invalidated: make(chan struct{}),
+	}
+	e.permit <- struct{}{}
+	return e
+}
+
 type reader struct {
 	t          *Torrent
 	responsive bool
@@ -48,6 +62,9 @@ type reader struct {
 	// We cache this so that changes can be detected, and bubbled up to the Torrent only as
 	// required.
 	pieces pieceRange
+	// Protected by mu. Reads within one epoch are serialized,
+	// but a Seek creates an independent epoch.
+	readEpoch *readerReadEpoch
 }
 
 var _ io.ReadCloser = (*reader)(nil)
@@ -142,14 +159,46 @@ func (r *reader) ReadContext(ctx context.Context, b []byte) (n int, err error) {
 		}()
 	}
 
-	// Snapshot the position and its generation before reading.
-	// Do not hold the lock during potentially blocking I/O.
+	// Select the current read epoch.
 	r.mu.Lock()
+	if r.readEpoch == nil {
+		r.readEpoch = newReaderReadEpoch()
+	}
+	epoch := r.readEpoch
+	r.mu.Unlock()
+
+	// Serialize reads only within this epoch.
+	// Waiting can be interrupted by a seek or cancellation.
+	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
+
+	case <-epoch.invalidated:
+		return 0, errReaderPositionChanged
+
+	case <-epoch.permit:
+	}
+	defer func() {
+		epoch.permit <- struct{}{}
+	}()
+
+	// A Seek could have happened while waiting for the permit.
+	r.mu.Lock()
+	if r.readEpoch != epoch {
+		r.mu.Unlock()
+		return 0, errReaderPositionChanged
+	}
+
 	startPos := r.pos
 	startGeneration := r.posGeneration
 	r.mu.Unlock()
 
-	n, err = r.readOnceAt(b, startPos, startGeneration, &ctxErr)
+	n, err = r.readOnceAt(
+		b,
+		startPos,
+		startGeneration,
+		&ctxErr,
+	)
 
 	if n == 0 {
 		if err == nil && len(b) > 0 {
@@ -160,8 +209,6 @@ func (r *reader) ReadContext(ctx context.Context, b []byte) (n int, err error) {
 
 	r.mu.Lock()
 
-	// A concurrent Seek invalidates the position update
-	// from this in-flight read.
 	if r.posGeneration == startGeneration {
 		r.pos += int64(n)
 		r.posChanged()
@@ -169,8 +216,6 @@ func (r *reader) ReadContext(ctx context.Context, b []byte) (n int, err error) {
 
 	r.mu.Unlock()
 
-	// EOF describes this read, not the potentially newer
-	// position established by a concurrent Seek.
 	if startPos+int64(n) >= r.length {
 		err = io.EOF
 	} else if err == io.EOF {
@@ -302,9 +347,16 @@ func (r *reader) Seek(off int64, whence int) (ret int64, err error) {
 		return r.pos, errors.New("bad whence")
 	}
 
-	// Any successful seek invalidates position updates
-	// from reads started before this operation.
+	// Invalidate position updates from old reads.
 	r.posGeneration++
+
+	// Release reads waiting in the old epoch.
+	// Already running storage I/O may continue, but reads
+	// started after this Seek use a fresh permit.
+	if r.readEpoch != nil {
+		close(r.readEpoch.invalidated)
+	}
+	r.readEpoch = newReaderReadEpoch()
 
 	ret = r.pos
 	r.posChanged()
