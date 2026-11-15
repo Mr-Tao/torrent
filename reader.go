@@ -38,9 +38,12 @@ type reader struct {
 	offset, length int64
 
 	// Required when modifying pos and readahead, or reading them without opMu.
-	mu        sync.Locker
-	pos       int64
-	readahead int64
+	mu  sync.Locker
+	pos int64
+	// Incremented by every successful Seek.
+	// Protected by mu (the torrent client's lock).
+	posGeneration uint64
+	readahead     int64
 	// The cached piece range this reader wants downloaded. The zero value corresponds to nothing.
 	// We cache this so that changes can be detected, and bubbled up to the Torrent only as
 	// required.
@@ -48,6 +51,9 @@ type reader struct {
 }
 
 var _ io.ReadCloser = (*reader)(nil)
+var errReaderPositionChanged = errors.New(
+	"torrent: reader position changed during read",
+)
 
 func (r *reader) SetResponsive() {
 	r.responsive = true
@@ -120,42 +126,57 @@ func (r *reader) Read(b []byte) (n int, err error) {
 }
 
 func (r *reader) ReadContext(ctx context.Context, b []byte) (n int, err error) {
-	// This is set under the Client lock if the Context is canceled. I think we coordinate on a
-	// separate variable so as to avoid false negatives with race conditions due to Contexts being
-	// synchronized.
 	var ctxErr error
+
 	if ctx.Done() != nil {
 		ctx, cancel := context.WithCancel(ctx)
-		// Abort the goroutine when the function returns.
 		defer cancel()
+
 		go func() {
 			<-ctx.Done()
+
 			r.t.cl.lock()
 			ctxErr = ctx.Err()
 			r.t.tickleReaders()
 			r.t.cl.unlock()
 		}()
 	}
-	// Hmmm, if a Read gets stuck, this means you can't change position for other purposes. That
-	// seems reasonable, but unusual.
-	n, err = r.readOnceAt(b, r.pos, &ctxErr)
+
+	// Snapshot the position and its generation before reading.
+	// Do not hold the lock during potentially blocking I/O.
+	r.mu.Lock()
+	startPos := r.pos
+	startGeneration := r.posGeneration
+	r.mu.Unlock()
+
+	n, err = r.readOnceAt(b, startPos, startGeneration, &ctxErr)
+
 	if n == 0 {
 		if err == nil && len(b) > 0 {
 			panic("expected error")
-		} else {
-			return
 		}
+		return
 	}
 
 	r.mu.Lock()
-	r.pos += int64(n)
-	r.posChanged()
+
+	// A concurrent Seek invalidates the position update
+	// from this in-flight read.
+	if r.posGeneration == startGeneration {
+		r.pos += int64(n)
+		r.posChanged()
+	}
+
 	r.mu.Unlock()
-	if r.pos >= r.length {
+
+	// EOF describes this read, not the potentially newer
+	// position established by a concurrent Seek.
+	if startPos+int64(n) >= r.length {
 		err = io.EOF
 	} else if err == io.EOF {
 		err = io.ErrUnexpectedEOF
 	}
+
 	return
 }
 
@@ -195,7 +216,7 @@ func (r *reader) torrentOffset(readerPos int64) int64 {
 }
 
 // Performs at most one successful read to torrent storage.
-func (r *reader) readOnceAt(b []byte, pos int64, ctxErr *error) (n int, err error) {
+func (r *reader) readOnceAt(b []byte, pos int64, generation uint64, ctxErr *error) (n int, err error) {
 	if pos >= r.length {
 		err = io.EOF
 		return
@@ -214,7 +235,19 @@ func (r *reader) readOnceAt(b []byte, pos int64, ctxErr *error) (n int, err erro
 			err = nil
 			return
 		}
+
 		r.t.cl.lock()
+
+		// A seek may have moved the reader to a different piece
+		// while storage I/O was in progress.
+		//
+		// The old read must not inspect or modify piece state
+		// based on the new reader position.
+		if r.posGeneration != generation {
+			r.t.cl.unlock()
+			return 0, errReaderPositionChanged
+		}
+
 		// TODO: Just reset pieces in the readahead window. This might help
 		// prevent thrashing with small caches and file and piece priorities.
 		r.log(log.Fstr("error reading torrent %s piece %d offset %d, %d bytes: %v",
@@ -257,6 +290,7 @@ func (r *reader) posChanged() {
 func (r *reader) Seek(off int64, whence int) (ret int64, err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
 	switch whence {
 	case io.SeekStart:
 		r.pos = off
@@ -265,10 +299,14 @@ func (r *reader) Seek(off int64, whence int) (ret int64, err error) {
 	case io.SeekEnd:
 		r.pos = r.length + off
 	default:
-		err = errors.New("bad whence")
+		return r.pos, errors.New("bad whence")
 	}
-	ret = r.pos
 
+	// Any successful seek invalidates position updates
+	// from reads started before this operation.
+	r.posGeneration++
+
+	ret = r.pos
 	r.posChanged()
 	return
 }
