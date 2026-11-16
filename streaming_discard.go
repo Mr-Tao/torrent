@@ -3,6 +3,8 @@ package torrent
 import (
 	"errors"
 	"fmt"
+
+	"github.com/anacrolix/missinggo/bitmap"
 )
 
 var ErrChunkDiscardBusy = errors.New(
@@ -65,18 +67,47 @@ func (p *Piece) DiscardChunkRange(
 	writing := p.pendingWrites != 0
 	p.pendingWritesMutex.Unlock()
 
-	if writing ||
-		p.hashing ||
-		p.queuedForHash() ||
-		t.pieceComplete(p.index) {
+	if writing || p.hashing || p.queuedForHash() {
 		return 0, ErrChunkDiscardBusy
 	}
 
-	// Discard the bytes before clearing the availability bits.
-	// No new received chunk can be registered while we hold
-	// the Client lock, and in-flight writes were rejected above.
+	wasComplete := t.pieceComplete(p.index)
+
+	// A complete piece represents all chunks through its
+	// completion flag. Before discarding any bytes, clear
+	// that flag in storage. The Client lock prevents other
+	// torrent operations from observing the transition.
+	if wasComplete {
+		if err := p.Storage().MarkNotComplete(); err != nil {
+			return 0, fmt.Errorf(
+				"torrent: mark piece incomplete: %w", err,
+			)
+		}
+	}
+
+	// The callback must be all-or-nothing. If it fails,
+	// restore the original completion state.
 	if err := discard(); err != nil {
+		if wasComplete {
+			if restoreErr := p.Storage().MarkComplete(); restoreErr != nil {
+				return 0, fmt.Errorf(
+					"torrent: discard failed: %v; "+
+						"restore completion failed: %w",
+					err, restoreErr,
+				)
+			}
+		}
 		return 0, err
+	}
+
+	if wasComplete {
+		// Completion previously represented the availability
+		// of every chunk. Reconstruct that state explicitly,
+		// then invalidate only the discarded range.
+		p.dirtyChunks.AddRange(
+			0,
+			bitmap.BitIndex(p.numChunks()),
+		)
 	}
 
 	invalidated := 0
@@ -90,11 +121,15 @@ func (p *Piece) DiscardChunkRange(
 		}
 	}
 
+	if wasComplete {
+		// This also updates priorities and notifies readers
+		// about the transition from complete to incomplete.
+		t.updatePieceCompletion(p.index)
+	}
+
 	if invalidated != 0 {
 		t.tickleReaders()
 
-		// Piece priority has not changed, so merely recalculating
-		// its priority may not wake any peer writer.
 		for c := range t.conns {
 			c.updateRequests()
 		}
