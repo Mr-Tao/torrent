@@ -343,9 +343,18 @@ func (r *reader) Close() error {
 func (r *reader) posChanged() {
 	to := r.piecesUncached()
 	from := r.pieces
+
 	if to == from {
+		if r.responsive {
+			// The read window moved inside the same piece.
+			// Request more chunks near the new position.
+			for c := range r.t.conns {
+				c.updateRequests()
+			}
+		}
 		return
 	}
+
 	r.pieces = to
 	// log.Printf("reader pos changed %v->%v", from, to)
 	r.t.readerPosChanged(from, to)

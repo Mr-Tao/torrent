@@ -813,21 +813,94 @@ func (cn *connection) iterPendingPiecesUntyped(f iter.Callback) {
 	cn.iterPendingPieces(func(i pieceIndex) bool { return f(i) })
 }
 
-func (cn *connection) iterPendingRequests(piece pieceIndex, f func(request) bool) bool {
-	return iterUndirtiedChunks(piece, cn.t, func(cs chunkSpec) bool {
-		r := request{pp.Integer(piece), cs}
-		if cn.t.requestStrategy == 3 {
-			cn.t.lastRequestedMu.RLock()
-			_, ok := cn.t.lastRequested[r]
-			cn.t.lastRequestedMu.RUnlock()
+func (cn *connection) iterPendingRequests(
+	piece pieceIndex,
+	f func(request) bool,
+) bool {
+	t := cn.t
+
+	emit := func(cs chunkSpec) bool {
+		req := request{pp.Integer(piece), cs}
+
+		if t.requestStrategy == 3 {
+			t.lastRequestedMu.RLock()
+			_, ok := t.lastRequested[req]
+			t.lastRequestedMu.RUnlock()
 			if ok {
-				// This piece has been requested on another connection, and
-				// the duplicate request timer is still running.
 				return true
 			}
 		}
-		return f(r)
-	})
+		return f(req)
+	}
+
+	pieceBegin := int64(piece) * t.info.PieceLength
+	pieceEnd := pieceBegin + int64(t.pieceLength(piece))
+	chunkSize := int64(t.chunkSize)
+	p := &t.pieces[piece]
+
+	// These fields are accessed under the Client lock,
+	// as in the existing request scheduling code.
+	hasResponsiveReader := false
+
+	for r := range t.readers {
+		if !r.responsive {
+			continue
+		}
+
+		fileBegin := r.offset
+		fileEnd := r.offset + r.length
+
+		// Only restrict pieces belonging to this reader's file.
+		if fileBegin >= pieceEnd || fileEnd <= pieceBegin {
+			continue
+		}
+		hasResponsiveReader = true
+
+		if r.pos < 0 || r.pos >= r.length {
+			continue
+		}
+
+		begin := r.offset + r.pos
+		ahead := r.readahead
+		if ahead < chunkSize {
+			ahead = chunkSize
+		}
+		if ahead > r.length-r.pos {
+			ahead = r.length - r.pos
+		}
+		end := begin + ahead
+
+		if begin < pieceBegin {
+			begin = pieceBegin
+		}
+		if end > pieceEnd {
+			end = pieceEnd
+		}
+		if begin >= end {
+			continue
+		}
+
+		first := (begin - pieceBegin) / chunkSize
+		last := (end - pieceBegin + chunkSize - 1) / chunkSize
+
+		for i := first; i < last; i++ {
+			if p.dirtyChunks.Contains(bitmap.BitIndex(i)) {
+				continue
+			}
+			if !emit(t.chunkIndexSpec(pp.Integer(i), piece)) {
+				return false
+			}
+		}
+	}
+
+	if hasResponsiveReader {
+		// Do not fall back to fetching every missing chunk
+		// of a large piece while streaming.
+		return true
+	}
+
+	// Preserve original scheduling for non-streaming pieces.
+	return iterUndirtiedChunks(piece, t, emit)
 }
 
 func iterUndirtiedChunks(piece pieceIndex, t *Torrent, f func(chunkSpec) bool) bool {
