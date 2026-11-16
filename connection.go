@@ -1510,7 +1510,12 @@ func (c *connection) uploadAllowed() bool {
 
 func (c *connection) setRetryUploadTimer(delay time.Duration) {
 	if c.uploadTimer == nil {
-		c.uploadTimer = time.AfterFunc(delay, c.writerCond.Broadcast)
+		c.uploadTimer = time.AfterFunc(delay, func() {
+			c.mu().Lock()
+			defer c.mu().Unlock()
+
+			c.tickleWriter()
+		})
 	} else {
 		c.uploadTimer.Reset(delay)
 	}
