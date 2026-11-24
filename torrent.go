@@ -24,6 +24,7 @@ import (
 	"github.com/anacrolix/missinggo/pubsub"
 	"github.com/anacrolix/missinggo/slices"
 	"github.com/anacrolix/torrent/bencode"
+	"github.com/anacrolix/torrent/internal/piecesha1"
 	"github.com/anacrolix/torrent/metainfo"
 	pp "github.com/anacrolix/torrent/peer_protocol"
 	"github.com/anacrolix/torrent/storage"
@@ -751,7 +752,8 @@ func (t *Torrent) pieceLength(piece pieceIndex) pp.Integer {
 }
 
 func (t *Torrent) hashPiece(piece pieceIndex) (ret metainfo.Hash) {
-	hash := pieceHash.New()
+	hash := piecesha1.New()
+	defer piecesha1.Close(hash)
 	p := &t.pieces[piece]
 	p.waitNoPendingWrites()
 	ip := t.info.Piece(int(piece))
