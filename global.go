@@ -1,14 +1,12 @@
 package torrent
 
 import (
-	"crypto"
 	"expvar"
 
 	pp "github.com/anacrolix/torrent/peer_protocol"
 )
 
 const (
-	pieceHash        = crypto.SHA1
 	maxRequests      = 250    // Maximum pending requests we allow peers to send us.
 	defaultChunkSize = 0x4000 // 16KiB
 )
